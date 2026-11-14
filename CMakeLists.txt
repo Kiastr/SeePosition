@@ -25,6 +25,10 @@ target_sources(SeePosition
         main.cpp
         Source/AudioCaptureService.cpp
         Source/AudioCaptureService.h
+        Source/Dsp/BandAnalyzer.h
+        Source/Dsp/DeltaEq.h
+        Source/Dsp/FingerprintGate.h
+        Source/Dsp/VoiceGate.h
         Source/MainComponent.cpp
         Source/MainComponent.h
         Source/WasapiLoopbackCapture.cpp
@@ -47,6 +51,13 @@ target_link_libraries(SeePosition
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )
+
+# 指纹模板包必须和 exe 放在一起，否则人声门自动失效（不影响启动）
+add_custom_command(TARGET SeePosition POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/fingerprints.ewg"
+        "$<TARGET_FILE_DIR:SeePosition>/fingerprints.ewg"
+    COMMENT "复制 fingerprints.ewg 到输出目录")
 
 if (MSVC)
     target_compile_options(SeePosition PRIVATE /utf-8)

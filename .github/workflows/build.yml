@@ -1,0 +1,82 @@
+name: Build
+
+# 双平台 CI：Linux 验证 GCC 编译链与 UI 启动，Windows 验证 MSVC 与
+# WASAPI 环回路径（那段代码被 #if JUCE_WINDOWS 保护，Linux 上编译不到）。
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (GCC 13 / JUCE 8.0.7)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ninja-build \
+            libasound2-dev libfreetype6-dev libfontconfig1-dev \
+            libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libgl1-mesa-dev \
+            xvfb
+
+      - name: 配置 CMake
+        # FetchContent 自动拉取 JUCE 8.0.7（与本地构建一致）
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: 编译
+        # JUCE 全量编译 + LTO 内存开销较大，限制并行度
+        run: cmake --build build --parallel 2
+
+      - name: 编译独立 DSP 测试程序
+        # 该程序不依赖 JUCE，只做语法/链接验证；运行需要自备 wav 语料
+        run: g++ -std=c++20 -O2 -Wall -Wextra -ISource Tests/fingerprint_test.cpp -o /tmp/fp_test
+
+      - name: 启动冒烟测试（10 秒）
+        # 无音频设备时 JUCE 会打印 ALSA 警告，但不影响启动；
+        # 只要进程存活到 timeout 就视为通过。
+        run: |
+          set +e
+          timeout 10s xvfb-run -a ./build/SeePosition_artefacts/Release/SeePosition
+          rc=$?
+          set -e
+          if [ "$rc" -ne 124 ]; then
+            echo "::error::进程在 10 秒内退出（rc=$rc），视为启动异常"
+            exit 1
+          fi
+          echo "启动后稳定运行 10 秒，无崩溃"
+
+      - name: 上传 Linux 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SeePosition-Linux-x86_64
+          path: build/SeePosition_artefacts/Release/
+          if-no-files-found: error
+
+  windows:
+    name: Windows (MSVC / WASAPI)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置 CMake
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: 编译
+        run: cmake --build build --config Release --parallel 2
+
+      - name: 上传 Windows 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SeePosition-Windows-x64
+          path: build/SeePosition_artefacts/Release/
+          if-no-files-found: error

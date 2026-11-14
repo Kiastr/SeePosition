@@ -932,17 +932,62 @@ void MainComponent::paint(juce::Graphics& g)
                                          mainDotRadius * 2.0f,
                                          mainDotRadius * 2.0f);
 
-    g.setColour(getIndicatorColour(displayConfidence).withAlpha(displayDotAlpha));
+    // 人声保持时降低圆点存在感：它表示的是「语音开始前的方位」，不是当前测量值。
+    const bool voiceHolding = audioCapture.isVoiceActive();
+    const float voiceDim = voiceHolding ? 0.55f : 1.0f;
+
+    g.setColour(getIndicatorColour(displayConfidence).withAlpha(displayDotAlpha * voiceDim));
     g.fillEllipse(mainDot);
 
     g.setColour(juce::Colours::black.withAlpha(0.10f + 0.25f * displayDotAlpha));
     g.drawEllipse(mainDot, 1.2f);
 
+    // 保持态外环：一眼区分「实时测量」与「冻结保持」，不依赖颜色记忆。
+    if (voiceHolding && displayDotAlpha > 0.05f)
+    {
+        g.setColour(juce::Colour::fromRGBA(140, 200, 220,
+                                           (juce::uint8) juce::jlimit(0, 255, (int) (170.0f * displayDotAlpha + 40.0f))));
+        g.drawEllipse(mainDot.expanded(3.0f), 1.3f);
+    }
+
+    //--- 人声状态指示：轨道右上角，仅在语音保持期间出现 -------------------------
+    if (voiceHolding)
+    {
+        const juce::String chipText = juce::String::fromUTF8("语音保持");
+        const juce::Font chipFont(juce::FontOptions(10.5f));
+        juce::GlyphArrangement ga;
+        ga.addLineOfText(chipFont, chipText, 0.0f, 0.0f);
+        const float textW = ga.getBoundingBox(0, chipText.length(), true).getWidth();
+        const float chipH = 15.0f;
+        const float chipW = textW + 24.0f;
+        const juce::Rectangle<float> chip(track.getRight() - chipW,
+                                          track.getY() - chipH - 4.0f,
+                                          chipW,
+                                          chipH);
+
+        g.setColour(juce::Colour::fromRGBA(140, 200, 220, 42));
+        g.fillRoundedRectangle(chip, chipH * 0.5f);
+        g.setColour(juce::Colour::fromRGBA(160, 215, 235, 235));
+        g.fillEllipse(chip.getX() + 7.0f, chip.getCentreY() - 2.5f, 5.0f, 5.0f);
+        g.setFont(chipFont);
+        g.drawSingleLineText(chipText,
+                            (int) (chip.getX() + 16.0f),
+                            (int) (chip.getCentreY() + 3.5f));
+    }
+
     if (isHovering)
     {
         g.setColour(juce::Colour::fromRGBA(206, 212, 222, 190));
         g.setFont(juce::FontOptions(11.0f));
-        g.drawFittedText(u8"按住ALT拖动软件位置",
+
+        // 状态感知提示：同一行文字轮换说明当前为什么圆点不动或没有方位。
+        juce::String hintText = juce::String::fromUTF8("按住ALT拖动软件位置");
+        if (!audioCapture.isVoiceGateReady())
+            hintText = juce::String::fromUTF8("人声模板未加载 · 按住ALT拖动软件位置");
+        else if (voiceHolding)
+            hintText = juce::String::fromUTF8("语音保持中 · 方位停在语音开始前");
+
+        g.drawFittedText(hintText,
                          fullBar.withTrimmedTop(fullBar.getHeight() * 0.62f).toNearestInt(),
                          juce::Justification::centred,
                          1);
@@ -1229,9 +1274,24 @@ void MainComponent::timerCallback()
     const float targetLeftLevel = juce::jlimit(0.0f, 1.0f, audioCapture.getLeftLevel());
     const float targetRightLevel = juce::jlimit(0.0f, 1.0f, audioCapture.getRightLevel());
 
+    // 人声判定：语音是单声道信号，既不能当成方位信息，也不能用来校准中心偏置。
+    const bool voiceNow = audioCapture.isVoiceActive();
+
+    // 维护「干净方位」历史：只记录非人声帧，供进入人声保持时回退取用。
+    if (!voiceNow)
+    {
+        voiceHistory[(size_t) voiceHistoryPos] = displayBalance;
+        voiceHistoryPos = (voiceHistoryPos + 1) % voiceHistorySize;
+        voiceHistoryCount = juce::jmin(voiceHistoryCount + 1, voiceHistorySize);
+    }
+
     // Auto-calibrate a tiny resting offset so the idle dot sits on exact center.
+    // 只在「非人声」的低电平时刻校准：语音句间的低电平里仍可能残留远处的游戏声方位，
+    // 此时学习会把真实方位误当成设备偏置，导致整场会话的方位系统性偏移。
     const float monoLevel = 0.5f * (targetLeftLevel + targetRightLevel);
-    if (monoLevel < visualTuning.centerBiasMonoGate && std::abs(rawBalance - centerBias) < 0.22f)
+    if (!voiceNow
+        && monoLevel < visualTuning.centerBiasMonoGate
+        && std::abs(rawBalance - centerBias) < 0.22f)
         centerBias += visualTuning.centerBiasLearningRate * (rawBalance - centerBias);
 
     float targetBalance = juce::jlimit(-1.0f, 1.0f, rawBalance - centerBias);
@@ -1243,7 +1303,7 @@ void MainComponent::timerCallback()
         return std::abs(v) < visualTuning.snapNearZeroEpsilon ? 0.0f : v;
     };
 
-    const float nextBalance = snapNearZero(targetBalance);
+    float nextBalance = snapNearZero(targetBalance);
     const float nextWidth = snapNearZero(targetWidth);
     const float nextLeftLevel = snapNearZero(targetLeftLevel);
     const float nextRightLevel = snapNearZero(targetRightLevel);
@@ -1252,11 +1312,53 @@ void MainComponent::timerCallback()
     const float gateSpan = juce::jmax(0.001f, visualTuning.levelGateHigh - visualTuning.levelGateLow);
     const float levelGate = juce::jlimit(0.0f, 1.0f, (nextSignal - visualTuning.levelGateLow) / gateSpan);
     const float minWeight = juce::jlimit(0.0f, 1.0f, visualTuning.positionWeightMin);
-    const float nextPositionWeight = minWeight + (1.0f - minWeight) * levelGate;
+    float nextPositionWeight = minWeight + (1.0f - minWeight) * levelGate;
 
     const float lrDiff = std::abs(nextRightLevel - nextLeftLevel);
     const float diffRatio = lrDiff / (nextLeftLevel + nextRightLevel + 1.0e-4f);
-    const float nextConfidence = juce::jlimit(0.0f, 1.0f, diffRatio * levelGate);
+    float nextConfidence = juce::jlimit(0.0f, 1.0f, diffRatio * levelGate);
+
+    //--- 人声保持 -------------------------------------------------------------
+    // 语音是单声道居中的宽频信号，一旦进入左右能量差就会把圆点拽向中心：
+    // 例如脚步 L0.30/R0.05（balance −0.95）叠加上队友语音 L=R=0.30 后会变成 −0.32，
+    // 圆点跨过轨道 63% 的宽度，给出一个并不存在的方位。
+    // 因此语音期间冻结方位类显示值，只让两侧电平条继续实时跳动。
+    //
+    // 注意：人声门要累积 50 帧（1 秒）历史才出判定，也就是说判定为真的那一刻，
+    // 当前 displayBalance 已经被语音污染了约 1 秒。直接冻结当前值等于把错误方位
+    // 贴上「保持」标签，比不冻结更糟。这里回退到 1.1 秒前的干净样本作为冻结值。
+    if (voiceNow)
+    {
+        if (!voiceHoldActive)
+        {
+            const int back = juce::jmin(voiceLookbackFrames, juce::jmax(0, voiceHistoryCount - 1));
+            const int idx = (voiceHistoryPos - 1 - back + voiceHistorySize * 2) % voiceHistorySize;
+            voiceHoldValue = (voiceHistoryCount > 0) ? voiceHistory[(size_t) idx] : displayBalance;
+        }
+
+        voiceHoldActive = true;
+        nextBalance = voiceHoldValue;
+        nextConfidence = displayConfidence;
+        nextPositionWeight = displayPositionWeight;
+    }
+    else
+    {
+        if (voiceHoldActive)
+        {
+            voiceHoldActive = false;
+            voiceResumeFrom = displayBalance;
+            voiceResumeElapsed = 0.0f;
+        }
+
+        if (voiceResumeElapsed < voiceResumeSeconds)
+        {
+            voiceResumeElapsed = juce::jmin(voiceResumeSeconds, voiceResumeElapsed + dt);
+            float t = voiceResumeElapsed / voiceResumeSeconds;
+            t = t * t * (3.0f - 2.0f * t);
+            nextBalance = voiceResumeFrom + (nextBalance - voiceResumeFrom) * t;
+        }
+    }
+
     const float minAlpha = juce::jlimit(0.0f, 1.0f, visualTuning.dotAlphaMin);
     const float alphaPower = juce::jmax(0.05f, visualTuning.dotAlphaPower);
     const float nextDotAlpha = juce::jlimit(minAlpha,

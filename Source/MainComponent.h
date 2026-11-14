@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -195,6 +196,19 @@ private:
     float displayDotAlpha = 0.0f;      ///< 当前主点透明度
     float displayPositionWeight = 0.0f; ///< 当前位置权重
     float centerBias = 0.0f;          ///< 中心偏置校准值
+
+    //--- 人声保持（语音期间冻结方位，避免单声道人声把圆点拉向中心）---
+    static constexpr float voiceResumeSeconds = 0.18f; ///< 退出保持的过渡时长（秒）
+    static constexpr int voiceHistorySize = 64;        ///< 干净方位历史长度（约 2.1 s @30Hz）
+    static constexpr int voiceLookbackFrames = 33;     ///< 回退帧数（约 1.1 s，覆盖人声门的 1 秒窗）
+
+    std::array<float, (size_t) voiceHistorySize> voiceHistory {}; ///< 只记录非人声帧的方位
+    int voiceHistoryPos = 0;           ///< 历史环形缓冲的写入位置
+    int voiceHistoryCount = 0;         ///< 已累积的有效样本数
+    bool voiceHoldActive = false;      ///< 是否正处于人声保持状态
+    float voiceHoldValue = 0.0f;       ///< 冻结值（来自历史回退，不是被污染的当前值）
+    float voiceResumeFrom = 0.0f;      ///< 退出保持时的方位起点
+    float voiceResumeElapsed = voiceResumeSeconds; ///< 退出保持后已过渡的时间（秒，初值=已完成）
     
     //--- 交互状态 ---
     bool isHovering = false;           ///< 鼠标是否悬停在组件上

@@ -16,6 +16,9 @@
 
 #include "AudioCaptureService.h"
 
+#include "Dsp/DeltaEq.h"   // handleBandFrame() 里的 delta::eqWeightAt()（16 带逆向 EQ 加权）
+
+#include <algorithm>
 #include <cmath>
 
 /**
@@ -28,6 +31,8 @@
  */
 AudioCaptureService::AudioCaptureService()
 {
+    loadFingerprintTemplates();
+
     if (startLoopbackCapture())
     {
         audioReady.store(true);
@@ -104,6 +109,26 @@ float AudioCaptureService::getLeftLevel() const noexcept
 float AudioCaptureService::getRightLevel() const noexcept
 {
     return rightLevel.load();
+}
+
+bool AudioCaptureService::isVoiceActive() const noexcept
+{
+    return voiceActive.load();
+}
+
+float AudioCaptureService::getVoiceConfidence() const noexcept
+{
+    return voiceConfidence.load();
+}
+
+float AudioCaptureService::getBandVoteBalance() const noexcept
+{
+    return bandVoteBalanceCache.load();
+}
+
+bool AudioCaptureService::isVoiceGateReady() const noexcept
+{
+    return voiceGate.loaded();
 }
 
 /**
@@ -474,6 +499,10 @@ void AudioCaptureService::processStereoBlock(const float* left,
         const double L = M + S;
         const double R = M - S;
 
+        // 16 带分析：只用分析链，不改变声音
+        if (bandAnalyzer.push((float) L, (float) R))
+            handleBandFrame();
+
         ll = oneMinusA * ll + a * L * L;
         rr = oneMinusA * rr + a * R * R;
         lr = oneMinusA * lr + a * L * R;
@@ -627,17 +656,27 @@ void AudioCaptureService::processStereoBlock(const float* left,
     const float relMid = juce::jmax(0.0f, blockMidRms - (float)(maskStrength * maskMid));
     const float relHigh = juce::jmax(0.0f, blockHighRms - (float)(maskStrength * maskHigh));
 
+    // 三带投票作为兜底（分析器还没出第一帧时用）。
     const float wLow = tuningBandVoteLowWeight.load() * relLow;
     const float wMid = tuningBandVoteMidWeight.load() * relMid;
     const float wHigh = tuningBandVoteHighWeight.load() * relHigh;
     const float weightSum = wLow + wMid + wHigh;
-    const float bandVoteBalance = weightSum > 1.0e-6f
-                                      ? juce::jlimit(-1.0f, 1.0f, (wLow * lowBalance + wMid * midBalance + wHigh * highBalance)
-                                                                  / weightSum)
-                                      : blockBalance;
-    const float directionConfidence = juce::jlimit(0.0f,
-                                                   1.0f,
-                                                   weightSum / (blockLowRms + blockMidRms + blockHighRms + 1.0e-6f));
+    const float legacyVote = weightSum > 1.0e-6f
+                                 ? juce::jlimit(-1.0f, 1.0f, (wLow * lowBalance + wMid * midBalance + wHigh * highBalance)
+                                                             / weightSum)
+                                 : blockBalance;
+    const float legacyConfidence = juce::jlimit(0.0f,
+                                                1.0f,
+                                                weightSum / (blockLowRms + blockMidRms + blockHighRms + 1.0e-6f));
+
+    // 16 带加权投票：权重来自 everplus 的 10 段 EQ 曲线（三角洲特化），
+    // 逐带单独算声像再按权重合成。比三带更细，但只覆盖 100–3200 Hz。
+    //
+    // 高频独占时不启用：枪声的高频脆响在 3.2 kHz 以上，16 带看不见，
+    // 这时退回三带投票（高频带权重 1.35），避免枪声方向变差。
+    const bool useBandVote = bandVoteValid && highFreqRatio < 0.50f;
+    const float bandVoteBalance = useBandVote ? cachedBandVoteBalance : legacyVote;
+    const float directionConfidence = useBandVote ? cachedBandConfidence : legacyConfidence;
 
     const auto loudEnoughDb = tuningLoudEnoughDb.load();
     const auto onsetContrastStart = tuningOnsetContrastStart.load();
@@ -893,7 +932,93 @@ void AudioCaptureService::prepareAnalysis(double sampleRate)
 {
     const double tauSeconds = 0.140;
     alpha = 1.0 - std::exp(-1.0 / (tauSeconds * juce::jmax(1.0, sampleRate)));
+    bandAnalyzer.prepare(sampleRate);
     resetAnalysis();
+}
+
+/**
+ * @brief 从 exe 同目录（或 Assets/）加载 EWG1 多模板指纹包
+ *
+ * 找不到文件不会影响启动：人声门自动失效，只是不再抑制语音误报。
+ * 模板由 Tools/gen_fingerprints.py 生成。
+ */
+void AudioCaptureService::loadFingerprintTemplates()
+{
+    const auto exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
+                            .getParentDirectory();
+    juce::File file = exeDir.getChildFile("fingerprints.ewg");
+    if (! file.existsAsFile())
+        file = exeDir.getChildFile("Assets").getChildFile("fingerprints.ewg");
+
+    if (! file.existsAsFile())
+        return;
+
+    voiceGate.loadFile(file.getFullPathName().toRawUTF8());
+}
+
+/**
+ * @brief 每凑满 20 ms 执行一次：16 带加权投票 + 人声门
+ *
+ * 投票权重 = 逆向 EQ 曲线（该频带的增益） × 低/中/高组微调 × 扣掉底噪后的残余能量
+ *
+ * 为什么用 EQ 曲线当权重：这条曲线是厂商针对这个游戏调的——
+ * 抬 125–250 Hz（脚步）、压 31.25–62.5 Hz（地鸣）。按它加权，
+ * 方向投票自然偏向脚步声所在的频段，而不是靠拍脑袋定 low/mid/high 三个常数。
+ *
+ * 逐带掩蔽：每带维护一个慢速底噪估计，投票前先扣掉。
+ * 空调声、引擎声这类持续成分不会一直把指针拽向某一侧。
+ */
+void AudioCaptureService::handleBandFrame() noexcept
+{
+    const auto& frame = bandAnalyzer.frame();
+
+    const float lowCut = tuningLowBandCutoffHz.load();
+    const float midCut = tuningMidBandCutoffHz.load();
+    const float trimLow = tuningBandVoteLowWeight.load();
+    const float trimMid = tuningBandVoteMidWeight.load();
+    const float trimHigh = tuningBandVoteHighWeight.load();
+    const float maskStrength = tuningBandMaskStrength.load();
+
+    std::array<float, delta::kBandCount> power {};
+    double wsum = 0.0;
+    double acc = 0.0;
+    double energy = 0.0;
+
+    for (int b = 0; b < delta::kBandCount; ++b)
+    {
+        const float e = frame.energy(b);
+        power[(std::size_t) b] = e;
+        energy += (double) e;
+
+        auto& mask = bandMask[(std::size_t) b];
+        mask += bandMaskCoeff * ((double) e - mask);
+        const float residual = (float) std::max(0.0, (double) e - (double) maskStrength * mask);
+
+        const float center = delta::bandCenterHz(b);
+        const float trim = (center < lowCut) ? trimLow : (center < midCut ? trimMid : trimHigh);
+        const float w = delta::eqWeightAt(center, eqWeightStrength) * trim * residual;
+
+        wsum += (double) w;
+        acc += (double) w * (double) frame.balance(b);
+    }
+
+    if (wsum > 1.0e-9)
+    {
+        cachedBandVoteBalance = (float) juce::jlimit(-1.0, 1.0, acc / wsum);
+        cachedBandConfidence = (float) juce::jlimit(0.0, 1.0, wsum / (energy + 1.0e-9));
+        bandVoteValid = true;
+    }
+    else
+    {
+        bandVoteValid = false;
+    }
+
+    bandVoteBalanceCache.store(cachedBandVoteBalance);
+
+    // 人声门：只做判定，不动声音
+    voiceGate.pushFrame(power);
+    voiceActive.store(voiceGate.active());
+    voiceConfidence.store(voiceGate.lastVoiceCosine());
 }
 
 /**
@@ -912,6 +1037,16 @@ void AudioCaptureService::prepareAnalysis(double sampleRate)
  */
 void AudioCaptureService::resetAnalysis()
 {
+    bandAnalyzer.reset();
+    voiceGate.reset();
+    bandMask.fill(0.0);
+    bandVoteValid = false;
+    cachedBandVoteBalance = 0.0f;
+    cachedBandConfidence = 0.0f;
+    bandVoteBalanceCache.store(0.0f);
+    voiceActive.store(false);
+    voiceConfidence.store(-1.0f);
+
     sLL = 0.0;
     sRR = 0.0;
     sLR = 0.0;
@@ -1041,6 +1176,11 @@ bool AudioCaptureService::startDefaultInputCapture()
  */
 void AudioCaptureService::pushTransientEvent(const TransientEvent& event) noexcept
 {
+    // 人声门：语音期间的居中事件几乎都是音节起音，不是威胁方向。
+    // 偏离中心的照常放行——游戏里真实的前左/前右脚步仍然要显示。
+    if (voiceActive.load(std::memory_order_relaxed) && std::abs(event.balance) < 0.30f)
+        return;
+
     const auto write = transientWriteIndex.load(std::memory_order_relaxed);
     const auto next = (write + 1) % transientQueueSize;
     const auto read = transientReadIndex.load(std::memory_order_acquire);

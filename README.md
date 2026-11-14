@@ -402,3 +402,153 @@ SeePosition.settings               # 用户设置文件
 <p align="center">
   Made with ❤️ by sweetorange1
 </p>
+
+---
+
+# 三角洲特化改造（本 fork 新增）
+
+本 fork 只改**分析口径**，不碰音频路径：不增强、不降噪、不改变你听到的任何声音，
+只是决定「哪些声音值得画成方向点」。
+
+## 新增能力
+
+### 1. 16 带 EQ 加权投票（替换三带硬编码权重）
+
+原版用 low/mid/high 三个固定权重（0.70 / 1.00 / 1.35）投票。
+本 fork 改用 everplus 反汇编得到的 10 段 EQ 曲线作为逐带权重：
+
+```
+31.25   62.5   125    250    500    1k     2k     4k     8k     16k
+-6      -2     +4     +3     -2     -1     +1     +1      0     -2  dB
+```
+
+16 个频带（100·32^(b/16)，100–3200 Hz）各自的权重由这条曲线对数插值得到。
+效果：125–250 Hz（脚步）加权，500 Hz 左右压低，方向投票自然偏向脚步所在频段。
+
+实测（两个声源分属不同频带、声像相反）：
+
+| 场景 | EQ 关 | EQ 开 | 偏移 |
+|---|---|---|---|
+| 125 Hz 左 + 500 Hz 右 | +0.172 | −0.135 | −0.307 |
+| 250 Hz 右 + 1 kHz 左 | −0.004 | +0.187 | +0.191 |
+| 2 kHz 左 + 250 Hz 右 | −0.075 | +0.016 | +0.091 |
+
+边界：16 带只覆盖 100–3200 Hz。当高频占比超过 0.5（枪声脆响），自动退回三带投票，
+避免枪声方向因看不见 3.2 kHz 以上而变差。
+
+### 2. FingerprintGate 多模板指纹门
+
+复用 everplus 的 WFP1 匹配机制（16 带对数功率 → 1 秒均值 → 去电平 → 余弦），
+把原来只认单个模板的加载器扩成 `EWG1` 容器，一个文件装任意多套模板：
+
+| 标签 | 来源 | 命中含义 |
+|---|---|---|
+| `wind` | 逆向产物（厂商 real 录音） | 风声，不画点 |
+| `rumble` | 逆向产物（原 npp） | 低频轰鸣，不画点 |
+| `voice` | 公开语料 + 音高变体 | 人声，不画点且丢弃居中事件 |
+
+`voice` 判定还要过第二道：1 秒包络起伏 ≥ 6 dB。
+
+实测：
+
+| 输入 | 人声余弦 | 包络起伏 | 判定 |
+|---|---|---|---|
+| jfk 语音 | 1.000 | 46.1 dB | 人声 |
+| 语音 + 立体声底噪 | 1.000 | 14.1 dB | 人声 |
+| 440 Hz 纯音 | 0.970 | 0.00 dB | 非人声 |
+| 白噪 | 0.793 | 0.75 dB | 非人声 |
+| 脉冲串 | 0.746 | 82.2 dB | 非人声 |
+| wind10 | 0.969 | 1.69 dB | 非人声 |
+| npp | 0.981 | 4.37 dB | 非人声 |
+
+纯音的余弦正好卡在 0.97，只靠指纹会误判；包络起伏这一条把它挡住了。
+
+### 3. 人声模板生成工具
+
+`Tools/gen_fingerprints.py` —— 任意语料 → EWG1 模板包：
+
+```bash
+python3 Tools/gen_fingerprints.py -o Assets/fingerprints.ewg \
+    --template "wind=wind10-reference.wav" \
+    --template "rumble=npp-reference.wav" \
+    --corpus "voice=./voice-corpus"
+```
+
+`voice` 建议用**你自己队友的真实语音**（QQ 语音录 1–2 分钟即可），比公开语料准。
+换语料后重新生成，覆盖 `Assets/fingerprints.ewg` 即可。
+
+## 构建与运行
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+构建后 `fingerprints.ewg` 会自动复制到 exe 同目录；缺失时人声门自动失效，不影响启动。
+
+## 验证（无需 JUCE）
+
+```bash
+g++ -std=c++20 -O2 -ISource Tests/fingerprint_test.cpp -o fp_test
+./fp_test Assets/fingerprints.ewg 某段语音.wav 某段游戏录音.wav
+```
+
+### 4. 人声保持（UI 层）
+
+前三项都在分析侧，圆点本身仍会被人声带偏；这一项补上视觉层的处理。
+
+**问题**：`balance` 是左右能量差的归一化值，语音是单声道居中信号，一进能量计算就按比例把方位拽向中央。
+
+| 场景 | sLL | sRR | balance |
+|---|---|---|---|
+| 脚步只在左（L 0.30 / R 0.05） | 0.090 | 0.0025 | −0.946 |
+| 叠加队友语音（L = R = 0.30） | 0.180 | 0.0925 | −0.321 |
+
+圆点跨过轨道 63% 的宽度，给出的方位并不存在。
+
+**改动点**（`Source/MainComponent.cpp`）：
+
+| 位置 | 改动 |
+|---|---|
+| `timerCallback()` | `centerBias` 学习加 `!voiceNow` 门控 —— 语音句间的低电平会把远处的游戏声方位误当成设备偏置学进去 |
+| `timerCallback()` | 维护只记录非人声帧的方位环形缓冲；语音期间用 1.1 s 前的干净样本冻结 `displayBalance / displayConfidence / displayPositionWeight`，退出后 180 ms smoothstep 过渡回实时值 |
+| `paint()` | 圆点 alpha × 0.55，外扩 3 px 画青灰环 —— 与「实时测量」区分 |
+| `paint()` | 轨道右上角显示「语音保持」胶囊 |
+| `paint()` | hover 文案状态感知：正常 / 语音保持中 / 人声模板未加载 |
+
+两侧电平条不冻结，继续实时跳动 —— 它是真实测量值，不涉及方位。
+
+**冻结的是哪个值**：这是这一项最容易做错的地方。人声门要累积 50 帧（1 秒）历史才出判定，判定为真的那一刻，`displayBalance` 已经被语音污染了整整 1 秒。直接冻结当前值，等于把一个错误方位贴上「保持」标签——比不冻结更糟。
+
+所以 `MainComponent` 维护一个**只记录非人声帧**的方位环形缓冲（64 帧 ≈ 2.1 秒），进入保持时回退 33 帧（≈1.1 秒，刚好越过人声门的 1 秒窗）取干净样本作为冻结值。
+
+| 时刻 | 状态 | displayBalance |
+|---|---|---|
+| 0–1.0 s | 脚步在左，干净 | −0.946 |
+| 1.0–2.0 s | 语音已进来，门还没判定 | −0.321（被污染，无法避免） |
+| 2.0 s | 判定为人声，回退取 1.1 s 前 | −0.946（纠正回干净值） |
+| 2.0–4.0 s | 保持中 | −0.946 |
+| 4.0 s 后 | 语音结束，180 ms smoothstep | 平滑到实时值 |
+
+**已知限制**：语音开口后的第一秒仍会被拉走（上表 1.0–2.0 s 那段），这是 1 秒分析窗的硬下限，只能在第二秒纠正回来。要治这一秒需要一个 ~150 ms 的快速单声道前哨（左右相关 > 0.99 且 `|balance| < 0.05`），但会误冻结真正的居中声源（正前方脚步），暂未启用。
+
+## 编译验证（2026-11-07）
+
+Linux + JUCE 8.0.7 + GCC 13，开启 JUCE 推荐警告集（`-Wall -Wextra -Wpedantic -Wshadow -Wsign-conversion -Wfloat-equal -Wswitch-enum` 等）：
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DFETCHCONTENT_SOURCE_DIR_JUCE=/path/to/JUCE-8.0.7
+cmake --build build -j
+```
+
+结果：**全量编译 + 链接通过，零错误零警告**，产出 `SeePosition_artefacts/Release/SeePosition`（5.2 MB）；
+`fingerprints.ewg` 由 POST_BUILD 自动复制到 exe 同目录。xvfb 下启动 12 秒无断言、无异常、无崩溃
+（只有沙箱缺 ALSA 设备的一条环境警告）。
+
+这一轮编译抓到并修掉了一个**既有错误**：`AudioCaptureService.cpp` 调用了 `delta::eqWeightAt()`
+却没有 `#include "Dsp/DeltaEq.h"`，导致整个工程编译失败。此前「DSP 模块零警告」只单独编译了头文件，
+没有编译调用点，所以漏掉了。现已补上 include。
+
+注意：Linux 构建里 `startLoopbackCapture()` 走 `#if JUCE_WINDOWS` 之外的分支，
+**WASAPI 环回路径没有被编译到**；Windows / MSVC 下仍需自行编译一次。

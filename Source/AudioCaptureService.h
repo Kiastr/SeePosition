@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "Dsp/BandAnalyzer.h"
+#include "Dsp/VoiceGate.h"
 #include "WasapiLoopbackCapture.h"
 
 /**
@@ -153,6 +155,15 @@ public:
     /** @brief 获取当前右声道电平 (0.0 ~ 1.0) */
     float getRightLevel() const noexcept;
     
+    /** @brief 是否正在播放人声（QQ 语音 / 游戏内语音） */
+    bool isVoiceActive() const noexcept;
+    /** @brief 最近一次人声指纹相似度（0~1，未就绪时 -1） */
+    float getVoiceConfidence() const noexcept;
+    /** @brief 16 带加权后的声像位置（与 getBalance 的区别：按逆向 EQ 曲线加权） */
+    float getBandVoteBalance() const noexcept;
+    /** @brief 人声模板是否加载成功 */
+    bool isVoiceGateReady() const noexcept;
+
     /** @brief 检查音频是否已就绪（设备已启动） */
     bool isAudioReady() const noexcept;
     /** @brief 获取最后一次错误信息 */
@@ -267,6 +278,26 @@ private:
     
     juce::AudioDeviceManager deviceManager;               ///< JUCE 音频设备管理器
     std::unique_ptr<WasapiLoopbackCapture> loopbackCapture; ///< WASAPI 环回捕获（Windows 专用）
+
+    //==============================================================================
+    // 成员变量 - 16 带分析与指纹门（三角洲特化）
+
+    delta::BandAnalyzer bandAnalyzer;   ///< 16 带分析器（everplus 分析链移植）
+    delta::VoiceGate voiceGate;         ///< 人声门（三模板指纹 + 包络起伏）
+
+    std::array<double, delta::kBandCount> bandMask {};  ///< 逐带底噪跟踪（掩蔽用）
+    double bandMaskCoeff = 0.04;         ///< 底噪跟踪系数（约 0.5 s 时间常数 @50 帧/秒）
+    float eqWeightStrength = 1.0f;       ///< 逆向 EQ 曲线的加权强度（0=平坦，1=完全采用）
+    float cachedBandVoteBalance = 0.0f;  ///< 16 带加权投票结果
+    float cachedBandConfidence = 0.0f;   ///< 16 带加权投票置信度
+    bool bandVoteValid = false;          ///< 是否已有一帧有效结果
+
+    std::atomic<bool> voiceActive { false };      ///< 人声判定（供 UI 与事件门读取）
+    std::atomic<float> voiceConfidence { -1.0f }; ///< 人声指纹相似度
+    std::atomic<float> bandVoteBalanceCache { 0.0f }; ///< 16 带加权声像（供 UI 读取）
+
+    void handleBandFrame() noexcept;     ///< 每凑满 20 ms 调用一次
+    void loadFingerprintTemplates();     ///< 从 exe 同目录加载 EWG1 指纹包
 
     //==============================================================================
     // 成员变量 - 实时数据（原子变量，线程安全）
