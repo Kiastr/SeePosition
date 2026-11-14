@@ -3,6 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey" alt="Platform">
+  <img src="https://github.com/Kiastr/SeePosition/actions/workflows/build.yml/badge.svg" alt="Build">
 </p>
 
 <p align="center">
@@ -551,4 +552,19 @@ cmake --build build -j
 没有编译调用点，所以漏掉了。现已补上 include。
 
 注意：Linux 构建里 `startLoopbackCapture()` 走 `#if JUCE_WINDOWS` 之外的分支，
-**WASAPI 环回路径没有被编译到**；Windows / MSVC 下仍需自行编译一次。
+**WASAPI 环回路径没有被编译到**，需要 Windows 构建来覆盖这一段。
+
+## 持续集成（2026-11-14）
+
+`.github/workflows/build.yml` 在 push / PR / 手动触发时运行两个 job：
+
+| Job | 环境 | 验证内容 |
+|---|---|---|
+| Linux | ubuntu-22.04 / GCC 13 / JUCE 8.0.7 | 全量编译、独立 DSP 测试程序编译、xvfb 下启动冒烟 10 秒、上传产物 |
+| Windows | windows-2022 / MSVC 17 (VS 2022) | 全量编译，覆盖上面那段 WASAPI 环回代码、上传产物 |
+
+首次运行：[run 43601604990](https://github.com/Kiastr/SeePosition/actions/runs/43601604990) —— 两个 job 全部 success。
+`fingerprints.ewg` 由 POST_BUILD 复制到 exe 同目录，两平台产物都带它，人声门开箱即用。
+
+两点要分清：CI 验证的是**编译与启动**，不是 WASAPI 环回在真实设备上的**运行**结果；
+Windows 产物仍需在本机接上实际音频会话跑一次才能确认环回捕获正常。
